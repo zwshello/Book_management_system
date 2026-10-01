@@ -1,0 +1,190 @@
+# Stage 10: core system. Root and service .env files contain local, uncommitted secrets.
+name: library-dev
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    networks: [library-net]
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1/]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  gateway:
+    build:
+      context: ./gateway
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${GATEWAY_PORT:-8080}:80"
+    depends_on:
+      frontend:
+        condition: service_healthy
+      user-service:
+        condition: service_healthy
+      book-service:
+        condition: service_healthy
+      borrow-service:
+        condition: service_healthy
+      statistics-service:
+        condition: service_healthy
+    networks: [library-net]
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1/gateway/health]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  user-service:
+    build:
+      context: .
+      dockerfile: deploy/docker/django/Dockerfile
+      args:
+        SERVICE_NAME: user-service
+    env_file: ./services/user-service/.env
+    environment:
+      DJANGO_DEBUG: "false"
+      DJANGO_HOST: 0.0.0.0
+      DJANGO_ALLOWED_HOSTS: user-service,127.0.0.1,localhost
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+    command: [sh, -c, "python manage.py migrate --noinput && exec python start.py"]
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks: [library-net]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health/live', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+
+  book-service:
+    build:
+      context: .
+      dockerfile: deploy/docker/django/Dockerfile
+      args:
+        SERVICE_NAME: book-service
+    env_file: ./services/book-service/.env
+    environment:
+      DJANGO_DEBUG: "false"
+      DJANGO_HOST: 0.0.0.0
+      DJANGO_ALLOWED_HOSTS: book-service,127.0.0.1,localhost
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      USER_SERVICE_URL: http://user-service:8001
+    command: [sh, -c, "python manage.py migrate --noinput && exec python start.py"]
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      user-service:
+        condition: service_healthy
+    networks: [library-net]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health/live', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+
+  borrow-service:
+    build:
+      context: .
+      dockerfile: deploy/docker/django/Dockerfile
+      args:
+        SERVICE_NAME: borrow-service
+    env_file: ./services/borrow-service/.env
+    environment:
+      DJANGO_DEBUG: "false"
+      DJANGO_HOST: 0.0.0.0
+      DJANGO_ALLOWED_HOSTS: borrow-service,127.0.0.1,localhost
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      USER_SERVICE_URL: http://user-service:8001
+      BOOK_SERVICE_URL: http://book-service:8002
+    command: [sh, -c, "python manage.py migrate --noinput && exec python start.py"]
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      user-service:
+        condition: service_healthy
+      book-service:
+        condition: service_healthy
+    networks: [library-net]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health/live', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+
+  statistics-service:
+    build:
+      context: .
+      dockerfile: deploy/docker/django/Dockerfile
+      args:
+        SERVICE_NAME: statistics-service
+    env_file: ./services/statistics-service/.env
+    environment:
+      DJANGO_DEBUG: "false"
+      DJANGO_HOST: 0.0.0.0
+      DJANGO_ALLOWED_HOSTS: statistics-service,127.0.0.1,localhost
+      USER_SERVICE_URL: http://user-service:8001
+      BOOK_SERVICE_URL: http://book-service:8002
+      BORROW_SERVICE_URL: http://borrow-service:8003
+    restart: unless-stopped
+    depends_on:
+      user-service:
+        condition: service_healthy
+      book-service:
+        condition: service_healthy
+      borrow-service:
+        condition: service_healthy
+    networks: [library-net]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8004/health/live', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Run scripts/setup_dev_env.py first}
+      USER_MYSQL_PASSWORD: ${USER_MYSQL_PASSWORD:?Missing user database password}
+      BOOK_MYSQL_PASSWORD: ${BOOK_MYSQL_PASSWORD:?Missing book database password}
+      BORROW_MYSQL_PASSWORD: ${BORROW_MYSQL_PASSWORD:?Missing borrow database password}
+    ports:
+      - "127.0.0.1:${MYSQL_PORT:-3306}:3306"
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./deploy/docker/mysql/init:/docker-entrypoint-initdb.d:ro
+    networks: [library-net]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          MYSQL_PWD=$$MYSQL_ROOT_PASSWORD mysql --protocol=TCP -h127.0.0.1 -uroot -N
+          -e "SELECT COUNT(*) FROM information_schema.SCHEMATA
+          WHERE SCHEMA_NAME IN ('user_db','book_db','borrow_db')" | grep -qx 3
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+volumes:
+  mysql-data:
+
+networks:
+  library-net:

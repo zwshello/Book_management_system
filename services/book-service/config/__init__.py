@@ -1,0 +1,1 @@
+"""book-service Django configuration."""
